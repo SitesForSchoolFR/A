@@ -850,7 +850,7 @@ kbd {
   background-image:
     linear-gradient(90deg, rgba(3, 5, 7, 0.96) 0%, rgba(3, 5, 7, 0.8) 36%, rgba(3, 5, 7, 0.42) 64%, rgba(3, 5, 7, 0.84) 100%),
     linear-gradient(180deg, rgba(3, 5, 7, 0.66) 0%, rgba(3, 5, 7, 0.22) 44%, rgba(3, 5, 7, 0.94) 100%),
-    url("assets/title-bg.jpg");
+    url("assets/title-bg.webp");
   background-size: cover;
   background-position: 50% 50%;
   background-repeat: no-repeat;
@@ -999,6 +999,29 @@ kbd {
   letter-spacing: 0.16em;
   text-transform: uppercase;
   color: var(--ink-faint);
+}
+
+.link-btn {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 2px 0;
+  color: var(--ink-dim);
+  font-family: inherit;
+  font-size: 9px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 4px;
+  text-decoration-color: rgba(207, 70, 57, 0.6);
+}
+
+.link-btn:hover,
+.link-btn:focus-visible {
+  color: var(--red-bright);
+  outline: none;
+  text-decoration-color: var(--red-bright);
 }
 
 .start-foot {
@@ -1166,7 +1189,7 @@ kbd {
   background-image:
     radial-gradient(circle at 50% 42%, rgba(135, 18, 8, 0.62), rgba(4, 6, 8, 0.9) 64%),
     linear-gradient(180deg, rgba(60, 4, 0, 0.42), rgba(3, 5, 7, 0.97)),
-    url("assets/title-bg.jpg");
+    url("assets/title-bg.webp");
   filter: saturate(0.55) contrast(1.12) brightness(0.85);
   animation-duration: 9s;
 }
@@ -1175,7 +1198,7 @@ kbd {
   background-image:
     radial-gradient(circle at 50% 0%, rgba(220, 235, 245, 0.3), transparent 52%),
     linear-gradient(180deg, rgba(225, 238, 244, 0.14), rgba(3, 5, 7, 0.96) 72%),
-    url("assets/title-bg.jpg");
+    url("assets/title-bg.webp");
   filter: saturate(0.4) brightness(1.18);
   animation-duration: 26s;
 }
@@ -1322,4 +1345,50 @@ kbd {
     animation-iteration-count: 1 !important;
     transition-duration: 0.001s !important;
   }
+}
+
+
+/* ============================================================
+   MODO LEVE (Xbox Series S / Edge, TVs e GPUs integradas)
+   ------------------------------------------------------------
+   Remove as camadas de composição mais caras: ruído SVG em tela
+   cheia, desfoques de backdrop, animação do fundo e filtros.
+   O jogo, a HUD e todos os efeitos de luz 3D continuam iguais.
+   ============================================================ */
+
+html.lite-mode #grain,
+html.lite-mode #static-fx,
+html.lite-mode .screen-bg::after {
+  display: none !important;
+}
+
+html.lite-mode #scanlines {
+  opacity: 0.16;
+  mix-blend-mode: normal;
+}
+
+html.lite-mode .hud-corner,
+html.lite-mode #reticle-prompt,
+html.lite-mode .overlay:not(.screen) {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+html.lite-mode .screen-bg {
+  animation: none !important;
+  opacity: 1;
+  background-position: 50% 50%;
+}
+
+html.lite-mode .death-bg,
+html.lite-mode .ending-bg {
+  filter: none !important;
+}
+
+html.lite-mode #damage {
+  transition: none;
+}
+
+html.lite-mode #reticle-prompt {
+  animation: none;
 }

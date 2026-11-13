@@ -17,6 +17,47 @@ import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 
 /* ============================================================
+   MODO LEVE / ORÇAMENTO DE QUALIDADE
+   ------------------------------------------------------------
+   Xbox Series S (Edge) e GPUs integradas têm limite de memória
+   de vídeo/cache. O modo leve reduz resolução, texturas, luzes,
+   partículas e sombras sem remover nenhuma mecânica do jogo.
+   Forçar: ?quality=low ou ?quality=high
+   ============================================================ */
+const QUALITY = (() => {
+  const params = new URLSearchParams(window.location.search);
+  const forced = (params.get('quality') || '').toLowerCase();
+  const ua = navigator.userAgent || '';
+  const isXbox = /xbox/i.test(ua);
+  const isMobile = /android|iphone|ipad|ipod|mobile/i.test(ua);
+  const memory = typeof navigator.deviceMemory === 'number' ? navigator.deviceMemory : 8;
+  const cores = navigator.hardwareConcurrency || 8;
+  const lite = forced === 'low'
+    ? true
+    : forced === 'high'
+      ? false
+      : (isXbox || isMobile || memory <= 4 || cores <= 4);
+
+  return {
+    lite,
+    isXbox,
+    pixelRatio: lite ? 1 : 1.35,
+    antialias: !lite,
+    shadowMapSize: lite ? 512 : 1024,
+    shadowType: lite ? THREE.PCFShadowMap : THREE.PCFSoftShadowMap,
+    shadowEvery: lite ? 2 : 1,
+    texScale: lite ? 0.5 : 1,
+    mipmaps: !lite,
+    dust: lite ? 260 : 800,
+    aura: lite ? 90 : 220,
+    audioNoiseSeconds: lite ? 1.2 : 2
+  };
+})();
+
+const ROOT = document.documentElement;
+ROOT.classList.toggle('lite-mode', QUALITY.lite);
+
+/* ============================================================
    0. DADOS NARRATIVOS
    ============================================================ */
 
@@ -188,6 +229,7 @@ const dom = {
 
   startScreen: $('start-screen'),
   startBtn: $('start-btn'),
+  qualityToggle: $('quality-toggle'),
 
   pauseScreen: $('pause-screen'),
   resumeBtn: $('resume-btn'),
@@ -221,6 +263,7 @@ const state = {
   recordsFound: 0,
   battery: 100,
   flashlightOn: true,
+  frame: 0,
   entry: '',
   entityActive: false,
   entitySeen: false,
@@ -261,6 +304,17 @@ const keys = { w: false, a: false, s: false, d: false, shift: false };
 const scheduledTimers = new Set();
 const cameraVel = new THREE.Vector3();
 const clock = new THREE.Clock();
+
+// vetores reaproveitados no loop: evita dezenas de alocações por frame (GC)
+const _tmpForward = new THREE.Vector3();
+const _tmpRight = new THREE.Vector3();
+const _tmpWish = new THREE.Vector3();
+const _tmpCamDir = new THREE.Vector3();
+const _tmpEye = new THREE.Vector3();
+const _tmpDirTo = new THREE.Vector3();
+const _upVector = new THREE.Vector3(0, 1, 0);
+const _visionRay = new THREE.Raycaster();
+const _interactionQuery = { score: -Infinity, item: null };
 
 function schedule(fn, delay) {
   const id = window.setTimeout(() => {
@@ -305,7 +359,7 @@ const AudioEngine = {
     this.master.gain.value = 0.85;
     this.master.connect(this.ctx.destination);
 
-    const len = Math.floor(this.ctx.sampleRate * 2);
+    const len = Math.floor(this.ctx.sampleRate * QUALITY.audioNoiseSeconds);
     this.noiseBuffer = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
     const data = this.noiseBuffer.getChannelData(0);
     for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
@@ -694,13 +748,71 @@ function createCanvas(w, h) {
   return c;
 }
 
+/* cache de geometrias: props repetidos (armários, canos, lâmpadas) passam a
+   compartilhar o mesmo buffer na GPU em vez de criar um por instância. */
+const GEOMETRY_CACHE = new Map();
+function cachedGeometry(key, factory) {
+  let geo = GEOMETRY_CACHE.get(key);
+  if (!geo) {
+    geo = factory();
+    GEOMETRY_CACHE.set(key, geo);
+  }
+  return geo;
+}
+function boxGeo(w, h, d) {
+  return cachedGeometry(`box|${w}|${h}|${d}`, () => new THREE.BoxGeometry(w, h, d));
+}
+function cylinderGeo(radiusTop, radiusBottom, height, radialSegments = 8, openEnded = false) {
+  return cachedGeometry(
+    `cyl|${radiusTop}|${radiusBottom}|${height}|${radialSegments}|${openEnded}`,
+    () => new THREE.CylinderGeometry(radiusTop, radiusBottom, height, radialSegments, 1, openEnded)
+  );
+}
+function sphereGeo(radius, widthSegments = 8, heightSegments = 6) {
+  return cachedGeometry(`sph|${radius}|${widthSegments}|${heightSegments}`,
+    () => new THREE.SphereGeometry(radius, widthSegments, heightSegments));
+}
+function planeGeo(width, height) {
+  return cachedGeometry(`pln|${width}|${height}`, () => new THREE.PlaneGeometry(width, height));
+}
+function circleGeo(radius, segments = 12) {
+  return cachedGeometry(`cir|${radius}|${segments}`, () => new THREE.CircleGeometry(radius, segments));
+}
+function torusGeo(radius, tube, radialSegments = 8, tubularSegments = 16, arc = Math.PI * 2) {
+  return cachedGeometry(`tor|${radius}|${tube}|${radialSegments}|${tubularSegments}|${arc}`,
+    () => new THREE.TorusGeometry(radius, tube, radialSegments, tubularSegments, arc));
+}
+function capsuleGeo(radius, length, capSegments = 3, radialSegments = 6) {
+  return cachedGeometry(`cap|${radius}|${length}|${capSegments}|${radialSegments}`,
+    () => new THREE.CapsuleGeometry(radius, length, capSegments, radialSegments));
+}
+
 function finishTexture(canvas, repeatX = 1, repeatY = 1) {
-  const tex = new THREE.CanvasTexture(canvas);
+  // No modo leve a textura é desenhada em resolução cheia apenas durante a
+  // criação e depois reduzida. Isso corta 75% dos pixels que vão para a GPU
+  // sem perder o desenho procedural (rachaduras, cartazes, mapa etc.).
+  let source = canvas;
+  if (QUALITY.texScale < 1) {
+    const smallW = Math.max(2, Math.round(canvas.width * QUALITY.texScale));
+    const smallH = Math.max(2, Math.round(canvas.height * QUALITY.texScale));
+    const small = createCanvas(smallW, smallH);
+    const sctx = small.getContext('2d');
+    sctx.imageSmoothingEnabled = true;
+    sctx.imageSmoothingQuality = 'high';
+    sctx.drawImage(canvas, 0, 0, smallW, smallH);
+    // libera o bitmap grande o quanto antes (pico de memória na inicialização)
+    canvas.width = 1;
+    canvas.height = 1;
+    source = small;
+  }
+  const tex = new THREE.CanvasTexture(source);
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.wrapS = THREE.RepeatWrapping;
   tex.wrapT = THREE.RepeatWrapping;
   tex.repeat.set(repeatX, repeatY);
-  tex.anisotropy = 4;
+  tex.generateMipmaps = QUALITY.mipmaps;
+  tex.minFilter = QUALITY.mipmaps ? THREE.LinearMipmapLinearFilter : THREE.LinearFilter;
+  tex.anisotropy = QUALITY.lite ? 2 : 4;
   return tex;
 }
 
@@ -1198,9 +1310,7 @@ function makeTallyTexture() {
   ctx.rotate(-0.07);
   ctx.fillText('NÃO DURMA', -240, 0);
   ctx.restore();
-  const tex = new THREE.CanvasTexture(c);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
+  return finishTexture(c, 1, 1);
 }
 
 function makeGlowTexture() {
@@ -1213,9 +1323,7 @@ function makeGlowTexture() {
   g.addColorStop(1, 'rgba(255,210,150,0)');
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, s, s);
-  const tex = new THREE.CanvasTexture(c);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
+  return finishTexture(c, 1, 1);
 }
 
 const M = {};
@@ -1287,10 +1395,18 @@ const EYE_HEIGHT = 1.62;
 const PLAYER_RADIUS = 0.34;
 const FLASHLIGHT_INTENSITY = 3.25;
 
+// geometrias reaproveitadas: menos objetos de geometria na memória da GPU
+const UNIT_BOX_GEOMETRY = boxGeo(1, 1, 1);
+const BULB_GEOMETRY = sphereGeo(0.085, 10, 8);
+
 function boxMesh(w, h, d, material, x, y, z, parent = world) {
-  const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
+  // Uma única BoxGeometry 1x1x1 compartilhada por todas as caixas do cenário.
+  // As UVs continuam 0..1 por face, então as texturas se comportam igual.
+  const mesh = new THREE.Mesh(UNIT_BOX_GEOMETRY, material);
+  mesh.scale.set(w, h, d);
   mesh.position.set(x, y, z);
-  mesh.castShadow = true;
+  // objetos minúsculos não entram no shadow map (menos draw calls na lanterna)
+  mesh.castShadow = w * h * d > 0.02;
   mesh.receiveShadow = true;
   parent.add(mesh);
   return mesh;
@@ -1368,7 +1484,7 @@ function addDoorLeaves(x, z, axis, width, side) {
     group.position.set(x + (dir * width) / 2, 0, z);
     const leaf = boxMesh(leafW, 2.16, 0.05, M.door, (-dir * leafW) / 2, 1.08, 0, group);
     leaf.castShadow = true;
-    const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.018, 0.12, 6), M.darkMetal);
+    const handle = new THREE.Mesh(cylinderGeo(0.018, 0.018, 0.12, 6), M.darkMetal);
     handle.rotation.z = Math.PI / 2;
     handle.position.set(-dir * (leafW - 0.14), 1.02, 0.05);
     group.add(handle);
@@ -1387,7 +1503,7 @@ function addSign(x, y, z, text, width, height, rotY = 0, opts = {}) {
     roughness: 0.85,
     metalness: 0.05
   });
-  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(width, height), mat);
+  const mesh = new THREE.Mesh(planeGeo(width, height), mat);
   mesh.position.set(x, y, z);
   mesh.rotation.y = rotY;
   world.add(mesh);
@@ -1395,7 +1511,7 @@ function addSign(x, y, z, text, width, height, rotY = 0, opts = {}) {
 }
 
 function addWallPanel(x, y, z, w, h, rotY, material) {
-  const mesh = new THREE.Mesh(new THREE.PlaneGeometry(w, h), material);
+  const mesh = new THREE.Mesh(planeGeo(w, h), material);
   mesh.position.set(x, y, z);
   mesh.rotation.y = rotY;
   mesh.receiveShadow = true;
@@ -1403,10 +1519,10 @@ function addWallPanel(x, y, z, w, h, rotY, material) {
   return mesh;
 }
 
-function addEmergencyLight(x, z, phase = 0, base = 1.55, color = 0xff2f18, y = 2.82) {
+function addEmergencyLight(x, z, phase = 0, base = 1.55, color = 0xff2f18, y = 2.82, liteKeep = true) {
   const housing = boxMesh(0.16, 0.12, 0.16, M.darkMetal, x, y + 0.18, z);
   housing.castShadow = false;
-  const wire = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.22, 5), M.rubber);
+  const wire = new THREE.Mesh(cylinderGeo(0.012, 0.012, 0.22, 5), M.rubber);
   wire.position.set(x, y + 0.08, z);
   world.add(wire);
 
@@ -1416,7 +1532,7 @@ function addEmergencyLight(x, z, phase = 0, base = 1.55, color = 0xff2f18, y = 2
     emissiveIntensity: 1.6,
     roughness: 0.35
   });
-  const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.085, 10, 8), bulbMat);
+  const bulb = new THREE.Mesh(BULB_GEOMETRY, bulbMat);
   bulb.position.set(x, y, z);
   world.add(bulb);
 
@@ -1433,15 +1549,20 @@ function addEmergencyLight(x, z, phase = 0, base = 1.55, color = 0xff2f18, y = 2
   glow.scale.setScalar(0.85);
   world.add(glow);
 
-  const light = new THREE.PointLight(color, base, 9, 1.7);
-  light.position.set(x, y - 0.05, z);
-  world.add(light);
+  // No modo leve algumas lâmpadas distantes continuam acesas visualmente
+  // (emissivo + sprite), mas sem PointLight real — o orçamento de luzes cai.
+  let light = null;
+  if (!QUALITY.lite || liteKeep) {
+    light = new THREE.PointLight(color, base, 9, 1.7);
+    light.position.set(x, y - 0.05, z);
+    world.add(light);
+  }
 
   emergencyLights.push({ light, bulbMat, glowMat, base, phase, x, z });
 }
 
 function addDust() {
-  const count = 900;
+  const count = QUALITY.dust;
   const positions = new Float32Array(count * 3);
   for (let i = 0; i < count; i++) {
     positions[i * 3] = rand(-16, 16);
@@ -1501,7 +1622,7 @@ function makeChair(x, z, rotY = 0, tipped = false) {
   [[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(([sx, sz]) => {
     boxMesh(0.035, 0.48, 0.035, M.darkMetal, sx * 0.19, 0.24, sz * 0.19, g);
   });
-  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.035, 0.24, 8), M.darkMetal);
+  const pole = new THREE.Mesh(cylinderGeo(0.03, 0.035, 0.24, 8), M.darkMetal);
   pole.position.y = 0.14;
   g.add(pole);
   world.add(g);
@@ -1516,7 +1637,7 @@ function makeMonitor(x, y, z, rotY = 0, variant = 0) {
   boxMesh(0.62, 0.46, 0.42, M.darkMetal, 0, 0.23, 0, g);
   boxMesh(0.5, 0.36, 0.03, M.trim, 0, 0.26, 0.215, g);
   const mat = [M.screenA, M.screenB, M.screenC][variant % 3].clone();
-  const screen = new THREE.Mesh(new THREE.PlaneGeometry(0.45, 0.31), mat);
+  const screen = new THREE.Mesh(planeGeo(0.45, 0.31), mat);
   screen.position.set(0, 0.26, 0.235);
   g.add(screen);
   // base
@@ -1534,7 +1655,7 @@ function makeRack(x, z, rotY = 0) {
   boxMesh(0.9, 1.66, 0.02, M.trim, 0, 0.96, 0.285, g);
   for (let i = 0; i < 5; i++) {
     boxMesh(0.82, 0.1, 0.03, M.metal, 0, 0.28 + i * 0.3, 0.3, g);
-    const knob = new THREE.Mesh(new THREE.CylinderGeometry(0.028, 0.028, 0.04, 8), M.metal);
+    const knob = new THREE.Mesh(cylinderGeo(0.028, 0.028, 0.04, 8), M.metal);
     knob.rotation.x = Math.PI / 2;
     knob.position.set(-0.24, 0.33 + i * 0.3, 0.33);
     g.add(knob);
@@ -1542,14 +1663,14 @@ function makeRack(x, z, rotY = 0) {
       boxMesh(0.02, 0.02, 0.02, M.screenA, 0.1 + k * 0.07, 0.34 + i * 0.3, 0.315, g);
     }
   }
-  const dot = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.1), M.screenB);
+  const dot = new THREE.Mesh(planeGeo(0.16, 0.1), M.screenB);
   dot.position.set(0.24, 1.55, 0.3);
   g.add(dot);
   // antena
-  const ant = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.012, 0.9, 6), M.metal);
+  const ant = new THREE.Mesh(cylinderGeo(0.008, 0.012, 0.9, 6), M.metal);
   ant.position.set(0.34, 2.2, 0);
   g.add(ant);
-  const tip = new THREE.Mesh(new THREE.SphereGeometry(0.02, 6, 6), M.screenA);
+  const tip = new THREE.Mesh(sphereGeo(0.02, 6, 6), M.screenA);
   tip.position.set(0.34, 2.66, 0);
   g.add(tip);
   world.add(g);
@@ -1573,7 +1694,7 @@ function makeLocker(x, z, rotY = 0, count = 1) {
         boxMesh(0.12, 0.02, 0.01, M.trim, cx, 1.5 + v * 0.08, 0.265, g);
       }
     }
-    const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, 0.14, 6), M.metal);
+    const handle = new THREE.Mesh(cylinderGeo(0.012, 0.012, 0.14, 6), M.metal);
     handle.position.set(cx + unitW / 2 - 0.09, 0.98, 0.28);
     g.add(handle);
   }
@@ -1654,13 +1775,13 @@ function makeGenerator(x, z, rotY = 0) {
   boxMesh(1.75, 1.0, 1.0, M.metal, 0, 0.82, 0, g);
   boxMesh(1.85, 0.14, 1.1, M.darkMetal, 0, 1.32, 0, g);
   // cilindro / tanque
-  const tank = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.32, 1.2, 14), M.metal);
+  const tank = new THREE.Mesh(cylinderGeo(0.32, 0.32, 1.2, 14), M.metal);
   tank.rotation.z = Math.PI / 2;
   tank.position.set(0, 1.53, -0.1);
   tank.castShadow = true;
   g.add(tank);
   // ventoinha
-  const fan = new THREE.Mesh(new THREE.TorusGeometry(0.28, 0.035, 6, 18), M.darkMetal);
+  const fan = new THREE.Mesh(torusGeo(0.28, 0.035, 6, 18), M.darkMetal);
   fan.position.set(-0.55, 0.82, 0.505);
   g.add(fan);
   for (let i = 0; i < 4; i++) {
@@ -1674,7 +1795,7 @@ function makeGenerator(x, z, rotY = 0) {
     led.castShadow = false;
   }
   // cano
-  const pipe = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.09, 1.2, 10), M.metal);
+  const pipe = new THREE.Mesh(cylinderGeo(0.09, 0.09, 1.2, 10), M.metal);
   pipe.position.set(0.55, 2.0, -0.2);
   g.add(pipe);
   world.add(g);
@@ -1683,13 +1804,13 @@ function makeGenerator(x, z, rotY = 0) {
 }
 
 function makeBarrel(x, z) {
-  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 0.9, 14), M.metal);
+  const barrel = new THREE.Mesh(cylinderGeo(0.3, 0.3, 0.9, 14), M.metal);
   barrel.position.set(x, 0.45, z);
   barrel.castShadow = true;
   barrel.receiveShadow = true;
   world.add(barrel);
   [0.2, 0.7].forEach((y) => {
-    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.31, 0.02, 5, 16), M.darkMetal);
+    const ring = new THREE.Mesh(torusGeo(0.31, 0.02, 5, 16), M.darkMetal);
     ring.rotation.x = Math.PI / 2;
     ring.position.set(x, y, z);
     world.add(ring);
@@ -1700,7 +1821,7 @@ function makeBarrel(x, z) {
 
 function makePapers(x, z, count = 5, radius = 1.2) {
   for (let i = 0; i < count; i++) {
-    const p = new THREE.Mesh(new THREE.PlaneGeometry(rand(0.16, 0.24), rand(0.2, 0.3)), M.paper);
+    const p = new THREE.Mesh(planeGeo(rand(0.16, 0.24), rand(0.2, 0.3)), M.paper);
     p.rotation.x = -Math.PI / 2;
     p.rotation.z = rand(0, Math.PI * 2);
     p.position.set(x + rand(-radius, radius), 0.012, z + rand(-radius, radius));
@@ -1710,7 +1831,7 @@ function makePapers(x, z, count = 5, radius = 1.2) {
 }
 
 function makeFloorPuddle(x, z, radius = 0.8) {
-  const p = new THREE.Mesh(new THREE.CircleGeometry(radius, 20), M.puddle);
+  const p = new THREE.Mesh(circleGeo(radius, 20), M.puddle);
   p.rotation.x = -Math.PI / 2;
   p.position.set(x, 0.011, z);
   world.add(p);
@@ -1739,7 +1860,7 @@ function makeExitDoor() {
   exitDoorMesh = door;
   boxMesh(1.7, 0.1, 0.14, M.darkMetal, 2, 1.82, 10.02);
   boxMesh(1.7, 0.1, 0.14, M.darkMetal, 2, 0.46, 10.02);
-  const wheel = new THREE.Mesh(new THREE.TorusGeometry(0.16, 0.025, 8, 20), M.metal);
+  const wheel = new THREE.Mesh(torusGeo(0.16, 0.025, 8, 20), M.metal);
   wheel.position.set(2.42, 1.15, 9.92);
   world.add(wheel);
   const wheelSpoke1 = boxMesh(0.34, 0.025, 0.025, M.metal, 2.42, 1.15, 9.92);
@@ -1749,7 +1870,7 @@ function makeExitDoor() {
 
   // claridade do lado de fora, revelada quando a porta abre no final
   const outsideGlow = new THREE.Mesh(
-    new THREE.PlaneGeometry(1.76, 2.28),
+    planeGeo(1.76, 2.28),
     new THREE.MeshBasicMaterial({ color: 0xe6f4ff, toneMapped: false })
   );
   outsideGlow.position.set(2, 1.14, 10.26);
@@ -1765,7 +1886,7 @@ function makeExitDoor() {
     emissiveIntensity: 2.2,
     roughness: 0.4
   });
-  const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.075, 10, 8), exitLightMat);
+  const lamp = new THREE.Mesh(sphereGeo(0.075, 10, 8), exitLightMat);
   lamp.position.set(3.35, 2.58, 9.84);
   world.add(lamp);
   const lampHousing = boxMesh(0.2, 0.2, 0.12, M.darkMetal, 3.35, 2.58, 9.9);
@@ -1779,7 +1900,7 @@ function makeExitDoor() {
     emissive: 0.35
   });
 
-  const hazard = new THREE.Mesh(new THREE.PlaneGeometry(2.6, 1.15), M.hazard);
+  const hazard = new THREE.Mesh(planeGeo(2.6, 1.15), M.hazard);
   hazard.rotation.x = -Math.PI / 2;
   hazard.position.set(2, 0.013, 9.05);
   world.add(hazard);
@@ -1805,24 +1926,24 @@ function makeExitDoor() {
 
 function makeTapeMesh() {
   const g = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.BoxGeometry(0.23, 0.045, 0.14), M.rubber);
+  const body = new THREE.Mesh(boxGeo(0.23, 0.045, 0.14), M.rubber);
   body.position.y = 0.023;
   body.castShadow = true;
   g.add(body);
-  const label = new THREE.Mesh(new THREE.PlaneGeometry(0.13, 0.07), M.paper);
+  const label = new THREE.Mesh(planeGeo(0.13, 0.07), M.paper);
   label.rotation.x = -Math.PI / 2;
   label.position.set(-0.02, 0.047, 0);
   g.add(label);
   [-0.045, 0.055].forEach((x) => {
-    const reel = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.012, 12), M.paper);
+    const reel = new THREE.Mesh(cylinderGeo(0.03, 0.03, 0.012, 12), M.paper);
     reel.position.set(x, 0.05, 0);
     g.add(reel);
-    const hole = new THREE.Mesh(new THREE.CylinderGeometry(0.013, 0.013, 0.014, 8), M.rubber);
+    const hole = new THREE.Mesh(cylinderGeo(0.013, 0.013, 0.014, 8), M.rubber);
     hole.position.set(x, 0.052, 0);
     g.add(hole);
   });
   const ledMat = new THREE.MeshBasicMaterial({ color: 0xff4a32 });
-  const led = new THREE.Mesh(new THREE.SphereGeometry(0.011, 6, 6), ledMat);
+  const led = new THREE.Mesh(sphereGeo(0.011, 6, 6), ledMat);
   led.position.set(0.09, 0.05, 0.05);
   g.add(led);
   g.userData.ledMat = ledMat;
@@ -1831,19 +1952,19 @@ function makeTapeMesh() {
 
 function makeDiaryMesh() {
   const g = new THREE.Group();
-  const cover = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.03, 0.3), M.darkMetal);
+  const cover = new THREE.Mesh(boxGeo(0.22, 0.03, 0.3), M.darkMetal);
   cover.position.y = 0.016;
   cover.castShadow = true;
   g.add(cover);
-  const pages = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.026, 0.28), M.paper);
+  const pages = new THREE.Mesh(boxGeo(0.2, 0.026, 0.28), M.paper);
   pages.position.y = 0.036;
   g.add(pages);
-  const band = new THREE.Mesh(new THREE.PlaneGeometry(0.05, 0.29), M.rubber);
+  const band = new THREE.Mesh(planeGeo(0.05, 0.29), M.rubber);
   band.rotation.x = -Math.PI / 2;
   band.position.set(0.02, 0.05, 0);
   g.add(band);
   const ledMat = new THREE.MeshBasicMaterial({ color: 0xffc36a });
-  const led = new THREE.Mesh(new THREE.SphereGeometry(0.01, 6, 6), ledMat);
+  const led = new THREE.Mesh(sphereGeo(0.01, 6, 6), ledMat);
   led.position.set(0.08, 0.055, 0.11);
   g.add(led);
   g.userData.ledMat = ledMat;
@@ -2029,12 +2150,12 @@ function findPath(start, goal) {
 /* ---------- estrutura ---------- */
 
 function buildStructure() {
-  const floor = new THREE.Mesh(new THREE.BoxGeometry(36, 0.2, 26), M.floor);
+  const floor = new THREE.Mesh(boxGeo(36, 0.2, 26), M.floor);
   floor.position.set(0, -0.1, -1);
   floor.receiveShadow = true;
   world.add(floor);
 
-  const ceiling = new THREE.Mesh(new THREE.BoxGeometry(36, 0.2, 26), M.ceiling);
+  const ceiling = new THREE.Mesh(boxGeo(36, 0.2, 26), M.ceiling);
   ceiling.position.set(0, 3.3, -1);
   ceiling.receiveShadow = true;
   world.add(ceiling);
@@ -2102,13 +2223,13 @@ function buildStructure() {
 
   // tubulações do corredor
   [-1.55, 1.55].forEach((z, idx) => {
-    const pipe = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 31.4, 10), M.metal);
+    const pipe = new THREE.Mesh(cylinderGeo(0.06, 0.06, 31.4, 10), M.metal);
     pipe.rotation.z = Math.PI / 2;
     pipe.position.set(0, 2.86 - idx * 0.12, z);
     pipe.castShadow = true;
     world.add(pipe);
     for (let x = -15; x <= 15; x += 3) {
-      const joint = new THREE.Mesh(new THREE.CylinderGeometry(0.085, 0.085, 0.08, 10), M.darkMetal);
+      const joint = new THREE.Mesh(cylinderGeo(0.085, 0.085, 0.08, 10), M.darkMetal);
       joint.rotation.z = Math.PI / 2;
       joint.position.set(x, 2.86 - idx * 0.12, z);
       world.add(joint);
@@ -2117,7 +2238,7 @@ function buildStructure() {
 
   // cabos soltos no teto
   for (let i = 0; i < 5; i++) {
-    const cable = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.014, 31, 6), M.rubber);
+    const cable = new THREE.Mesh(cylinderGeo(0.014, 0.014, 31, 6), M.rubber);
     cable.rotation.z = Math.PI / 2;
     cable.position.set(0, 2.98 - i * 0.03, -1.75 + i * 0.06);
     world.add(cable);
@@ -2172,7 +2293,7 @@ function buildProps() {
   makeMonitor(1.2, 0.95, -9.0, -Math.PI / 2, 1);
   addWallPanel(-5.86, 1.8, -8.2, 2.3, 1.1, Math.PI / 2, M.map);
   // fones sobre a mesa
-  const phones = new THREE.Mesh(new THREE.TorusGeometry(0.16, 0.03, 6, 14, Math.PI), M.rubber);
+  const phones = new THREE.Mesh(torusGeo(0.16, 0.03, 6, 14, Math.PI), M.rubber);
   phones.rotation.x = Math.PI / 2;
   phones.position.set(-0.6, 0.99, -6.6);
   world.add(phones);
@@ -2193,7 +2314,7 @@ function buildProps() {
   makeChair(13.6, -8.2, Math.PI - 0.2);
   makeCrate(8.6, -5.0, 0.8);
   makePapers(12.0, -6.2, 5, 1.5);
-  addEmergencyLight(14.8, -6.6, 3.1, 1.75);
+  addEmergencyLight(14.8, -6.6, 3.1, 1.75, 0xff2f18, 2.82, false);
   addFlavor(6.5, 1.2, -10.6, 'Examinar o beliche',
     'O lençol de cima está puxado para trás, como se alguém tivesse acabado de levantar. Ainda está morno.');
   addFlavor(2.4, 1.2, -7.6, 'Examinar os armários',
@@ -2217,11 +2338,11 @@ function buildProps() {
     metalness: 0,
     depthWrite: false
   });
-  const tally = new THREE.Mesh(new THREE.PlaneGeometry(1.05, 1.05), tallyMat);
+  const tally = new THREE.Mesh(planeGeo(1.05, 1.05), tallyMat);
   tally.position.set(-11.0, 1.4, 9.86);
   tally.rotation.y = Math.PI;
   world.add(tally);
-  addEmergencyLight(-5.2, 6.2, 4.6, 1.8);
+  addEmergencyLight(-5.2, 6.2, 4.6, 1.8, 0xff2f18, 2.82, false);
   addFlavor(-11.0, 1.42, 9.62, 'Examinar os riscos na parede',
     'Nove riscos, feitos com a unha. O último ainda tem uma gota de sangue seca embaixo.');
   addFlavor(-4.3, 1.4, 3.2, 'Examinar as prateleiras',
@@ -2261,7 +2382,7 @@ function buildProps() {
   for (let i = 0; i < 6; i++) {
     boxMesh(0.06, 0.16, 0.04, M.rubber, 15.7, 1.2 + i * 0.13, 5.0 + (i % 2) * 0.25);
   }
-  addEmergencyLight(14.6, 4.2, 5.6, 1.9);
+  addEmergencyLight(14.6, 4.2, 5.6, 1.9, 0xff2f18, 2.82, false);
   addFlavor(15.5, 1.6, 5.4, 'Examinar o painel elétrico',
     'Todos os disjuntores estão derretidos. Mesmo assim, as luzes vermelhas continuam piscando, vindas de uma fonte que não está ligada.');
   addFlavor(10.3, 1.45, 8.5, 'Examinar o gerador',
@@ -2275,7 +2396,7 @@ function buildProps() {
   addEmergencyLight(-8.8, 0, 0.9, 2.15);
   addEmergencyLight(8.8, 0, 2.9, 2.15);
   // extintor
-  const ext = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.5, 10), M.metal);
+  const ext = new THREE.Mesh(cylinderGeo(0.08, 0.08, 0.5, 10), M.metal);
   ext.position.set(-15.8, 1.1, -0.4);
   world.add(ext);
   makePapers(2.4, 1.4, 4, 1.0);
@@ -2291,11 +2412,11 @@ function buildLights() {
   flashlight = new THREE.SpotLight(0xfff0d4, FLASHLIGHT_INTENSITY, 32, 0.5, 0.62, 1.1);
   flashlight.position.set(0.26, -0.22, 0.02);
   flashlight.castShadow = true;
-  flashlight.shadow.mapSize.set(1024, 1024);
+  flashlight.shadow.mapSize.set(QUALITY.shadowMapSize, QUALITY.shadowMapSize);
+  flashlight.shadow.radius = QUALITY.lite ? 1 : 2;
   flashlight.shadow.camera.near = 0.4;
   flashlight.shadow.camera.far = 34;
   flashlight.shadow.bias = -0.0012;
-  flashlight.shadow.radius = 2;
   flashlightTarget = new THREE.Object3D();
   flashlightTarget.position.set(0, 0, -1);
   camera.add(flashlight);
@@ -2304,10 +2425,10 @@ function buildLights() {
 
   // lanterna física (modelo)
   torchGroup = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.036, 0.26, 12), M.darkMetal);
+  const body = new THREE.Mesh(cylinderGeo(0.032, 0.036, 0.26, 12), M.darkMetal);
   body.rotation.x = Math.PI / 2;
   torchGroup.add(body);
-  const head = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.04, 0.08, 12), M.metal);
+  const head = new THREE.Mesh(cylinderGeo(0.055, 0.04, 0.08, 12), M.metal);
   head.rotation.x = Math.PI / 2;
   head.position.z = -0.16;
   torchGroup.add(head);
@@ -2317,7 +2438,7 @@ function buildLights() {
     emissiveIntensity: 1.2,
     roughness: 0.2
   });
-  const lens = new THREE.Mesh(new THREE.CircleGeometry(0.045, 14), torchLensMat);
+  const lens = new THREE.Mesh(circleGeo(0.045, 14), torchLensMat);
   lens.position.z = -0.201;
   lens.rotation.y = Math.PI;
   torchGroup.add(lens);
@@ -2332,16 +2453,18 @@ function buildLights() {
     emissiveIntensity: 0.7,
     roughness: 0.4
   });
-  const tube = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.06, 0.16), tubeMat);
+  const tube = new THREE.Mesh(boxGeo(1.15, 0.06, 0.16), tubeMat);
   tube.position.set(-4.4, 3.08, 0);
   world.add(tube);
   const tube2 = tube.clone();
   tube2.position.set(6.0, 3.08, 0);
   tube2.material = tubeMat.clone();
   world.add(tube2);
-  const fluorescentLight = new THREE.PointLight(0xbcd8d2, 0.55, 9, 1.8);
-  fluorescentLight.position.set(-4.4, 2.95, 0);
-  world.add(fluorescentLight);
+  const fluorescentLight = QUALITY.lite ? null : new THREE.PointLight(0xbcd8d2, 0.55, 9, 1.8);
+  if (fluorescentLight) {
+    fluorescentLight.position.set(-4.4, 2.95, 0);
+    world.add(fluorescentLight);
+  }
   emergencyLights.push({
     light: fluorescentLight,
     bulbMat: tubeMat,
@@ -2374,7 +2497,7 @@ function buildWorld() {
     opacity: 0.75
   });
   [[-11.4, -2.9, 0.5], [1.6, 1.5, 0.35], [-8.9, 5.4, 0.4]].forEach(([x, z, r]) => {
-    const stain = new THREE.Mesh(new THREE.CircleGeometry(r, 16), stainMat);
+    const stain = new THREE.Mesh(circleGeo(r, 16), stainMat);
     stain.rotation.x = -Math.PI / 2;
     stain.position.set(x, 0.014, z);
     world.add(stain);
@@ -2394,29 +2517,29 @@ function buildEntity() {
     metalness: 0.18
   });
 
-  const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.25, 0.72, 4, 10), bodyMat);
+  const torso = new THREE.Mesh(capsuleGeo(0.25, 0.72, 4, 10), bodyMat);
   torso.position.set(0, 1.28, 0);
   torso.castShadow = true;
   g.add(torso);
 
-  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.08, 0.16, 8), bodyMat);
+  const neck = new THREE.Mesh(cylinderGeo(0.06, 0.08, 0.16, 8), bodyMat);
   neck.position.set(0, 1.82, 0);
   g.add(neck);
 
   const headGroup = new THREE.Group();
   headGroup.position.set(0, 1.96, 0.02);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.165, 14, 12), bodyMat);
+  const head = new THREE.Mesh(sphereGeo(0.165, 14, 12), bodyMat);
   head.scale.set(0.92, 1.22, 0.94);
   head.castShadow = true;
   headGroup.add(head);
   // olhos
   const eyeMat = new THREE.MeshBasicMaterial({ color: 0xe8f4ff });
   [-0.06, 0.06].forEach((x) => {
-    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.018, 6, 6), eyeMat);
+    const eye = new THREE.Mesh(sphereGeo(0.018, 6, 6), eyeMat);
     eye.position.set(x, 0.03, 0.155);
     headGroup.add(eye);
   });
-  const mouth = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.012, 0.01), new THREE.MeshBasicMaterial({ color: 0x8b0f0f }));
+  const mouth = new THREE.Mesh(boxGeo(0.1, 0.012, 0.01), new THREE.MeshBasicMaterial({ color: 0x8b0f0f }));
   mouth.position.set(0, -0.055, 0.156);
   headGroup.add(mouth);
   g.add(headGroup);
@@ -2424,7 +2547,7 @@ function buildEntity() {
   const makeLimb = (x, y, len, radius, offX = 0) => {
     const pivot = new THREE.Group();
     pivot.position.set(x, y, 0);
-    const limb = new THREE.Mesh(new THREE.CapsuleGeometry(radius, len, 3, 6), bodyMat);
+    const limb = new THREE.Mesh(capsuleGeo(radius, len, 3, 6), bodyMat);
     limb.position.set(offX, -len / 2 - radius * 0.4, 0);
     limb.castShadow = true;
     pivot.add(limb);
@@ -2441,7 +2564,7 @@ function buildEntity() {
   armR.rotation.z = -0.09;
 
   // aura de estática
-  const count = 260;
+  const count = QUALITY.aura;
   const positions = new Float32Array(count * 3);
   const basePositions = new Float32Array(count * 3);
   for (let i = 0; i < count; i++) {
@@ -2537,26 +2660,26 @@ function entityVision() {
   const dx = entity.position.x - camera.position.x;
   const dz = entity.position.z - camera.position.z;
   const dist = Math.hypot(dx, dz);
-  const eye = new THREE.Vector3(0, 0, 0);
-  entity.getWorldPosition(eye);
-  eye.y = 1.5;
+  _tmpEye.set(0, 0, 0);
+  entity.getWorldPosition(_tmpEye);
+  _tmpEye.y = 1.5;
 
-  const dirTo = new THREE.Vector3().subVectors(eye, camera.position);
-  const len = dirTo.length();
+  _tmpDirTo.subVectors(_tmpEye, camera.position);
+  const len = _tmpDirTo.length();
   if (len < 0.001) return { dist, seen: true, lit: false };
-  dirTo.divideScalar(len);
+  _tmpDirTo.divideScalar(len);
 
-  const camDir = new THREE.Vector3();
-  camera.getWorldDirection(camDir);
-  const alignment = camDir.dot(dirTo);
+  camera.getWorldDirection(_tmpCamDir);
+  const alignment = _tmpCamDir.dot(_tmpDirTo);
   const inView = alignment > 0.2;
   const inBeam = alignment > 0.86;
 
   let seen = false;
   if (inView) {
-    const ray = new THREE.Raycaster(camera.position, dirTo, 0.1, Math.max(0.2, len - 0.35));
-    const hits = ray.intersectObjects(wallMeshes, false);
-    seen = hits.length === 0;
+    _visionRay.set(camera.position, _tmpDirTo);
+    _visionRay.near = 0.1;
+    _visionRay.far = Math.max(0.2, len - 0.35);
+    seen = _visionRay.intersectObjects(wallMeshes, false).length === 0;
   }
   return { dist, seen, lit: seen && inBeam && dist < 20 };
 }
@@ -2768,22 +2891,21 @@ function collidesAt(x, z) {
 }
 
 function updatePlayer(dt) {
-  const forward = new THREE.Vector3();
-  camera.getWorldDirection(forward);
-  forward.y = 0;
-  if (forward.lengthSq() < 0.0001) forward.set(0, 0, -1);
-  forward.normalize();
-  const right = new THREE.Vector3().crossVectors(forward, new THREE.Vector3(0, 1, 0)).normalize();
+  camera.getWorldDirection(_tmpForward);
+  _tmpForward.y = 0;
+  if (_tmpForward.lengthSq() < 0.0001) _tmpForward.set(0, 0, -1);
+  _tmpForward.normalize();
+  _tmpRight.crossVectors(_tmpForward, _upVector).normalize();
 
-  const wish = new THREE.Vector3();
-  if (keys.w) wish.add(forward);
-  if (keys.s) wish.sub(forward);
-  if (keys.d) wish.add(right);
-  if (keys.a) wish.sub(right);
-  if (wish.lengthSq() > 0) wish.normalize();
+  _tmpWish.set(0, 0, 0);
+  if (keys.w) _tmpWish.add(_tmpForward);
+  if (keys.s) _tmpWish.sub(_tmpForward);
+  if (keys.d) _tmpWish.add(_tmpRight);
+  if (keys.a) _tmpWish.sub(_tmpRight);
+  if (_tmpWish.lengthSq() > 0) _tmpWish.normalize();
 
   const speed = keys.shift ? 4.55 : 2.85;
-  const targetVel = wish.multiplyScalar(speed);
+  const targetVel = _tmpWish.multiplyScalar(speed);
   const accel = 1 - Math.exp(-12 * dt);
   cameraVel.lerp(targetVel, accel);
   if (cameraVel.lengthSq() < 0.0002) cameraVel.set(0, 0, 0);
@@ -2851,15 +2973,22 @@ function toggleFlashlight() {
 }
 
 function findInteractable() {
-  const best = { score: -Infinity, item: null };
-  const camDir = new THREE.Vector3();
-  camera.getWorldDirection(camDir);
-  for (const item of interactables) {
+  const best = _interactionQuery;
+  best.score = -Infinity;
+  best.item = null;
+  camera.getWorldDirection(_tmpCamDir);
+  const cx = camera.position.x;
+  const cy = camera.position.y;
+  const cz = camera.position.z;
+  for (let i = 0; i < interactables.length; i++) {
+    const item = interactables[i];
     if (item.kind === 'record' && item.record.collected) continue;
-    const v = item.position.clone().sub(camera.position);
-    const dist = v.length();
+    const dx = item.position.x - cx;
+    const dy = item.position.y - cy;
+    const dz = item.position.z - cz;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
     if (dist > item.range) continue;
-    const dot = v.normalize().dot(camDir);
+    const dot = dist > 1e-5 ? (dx * _tmpCamDir.x + dy * _tmpCamDir.y + dz * _tmpCamDir.z) / dist : 0;
     if (dist > 1.25 && dot < 0.5) continue;
     const score = dot - dist * 0.08 + (item.kind === 'record' ? 0.22 : 0);
     if (score > best.score) {
@@ -3300,7 +3429,7 @@ function updateDying(dt, t) {
     entity.rotation.y = Math.atan2(camera.position.x - entity.position.x, camera.position.z - entity.position.z);
     entity.scale.setScalar(1 + k * 0.18);
   }
-  dom.staticFx.style.opacity = String(0.5 + Math.random() * 0.45);
+  if (!QUALITY.lite) dom.staticFx.style.opacity = String(0.5 + Math.random() * 0.45);
   if (state.deathTimer <= 0) showGameOver();
 }
 
@@ -3535,7 +3664,7 @@ function updateLights(dt, t) {
     if (noise > 0.965) flick = 0.15;
     if (e.fluorescent) flick *= Math.random() < 0.06 ? 0.1 : 1;
     const intensity = e.base * pulse * flick * globalFlicker;
-    e.light.intensity = intensity;
+    if (e.light) e.light.intensity = intensity;
     if (e.bulbMat) {
       e.bulbMat.emissiveIntensity = 0.6 + pulse * 1.6 * flick * globalFlicker;
     }
@@ -3578,7 +3707,7 @@ function updateScreenFX(dt) {
     ? target
     : lerp(state.staticLevel, target, 1 - Math.exp(-3.5 * dt));
   state.staticPulse = Math.max(0, state.staticPulse - dt * 1.6);
-  dom.staticFx.style.opacity = state.staticLevel.toFixed(3);
+  if (!QUALITY.lite) dom.staticFx.style.opacity = state.staticLevel.toFixed(3);
   dom.damage.style.opacity = near > 0.75 ? String((near - 0.75) * 0.9) : '0';
 
   state.tensionClock -= dt;
@@ -3648,19 +3777,12 @@ function animate() {
     }
   }
 
-  if (entity && entity.visible && state.phase !== 'dying') {
-    // aura continua viva mesmo com o jogo pausado
-    const pos = entityParts.auraGeo.attributes.position;
-    const base = entityParts.basePositions;
-    for (let i = 0; i < pos.count; i += 3) {
-      pos.array[i * 3] = base[i * 3] + Math.sin(t * 9 + i) * 0.05;
-      pos.array[i * 3 + 1] = base[i * 3 + 1] + Math.cos(t * 7 + i) * 0.05;
-      pos.array[i * 3 + 2] = base[i * 3 + 2] + Math.sin(t * 8 + i * 2) * 0.05;
-    }
-    pos.needsUpdate = true;
-  }
-
+  // sombras em passo reduzido (e só com a lanterna acesa)
+  renderer.shadowMap.needsUpdate = state.flashlightOn
+    && state.battery > 0
+    && state.frame % QUALITY.shadowEvery === 0;
   renderer.render(scene, camera);
+  state.frame += 1;
 }
 
 /* ============================================================
@@ -3671,12 +3793,32 @@ function onResize() {
   if (!renderer || !camera) return;
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.55));
+  renderer.setPixelRatio(effectivePixelRatio());
   renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.needsUpdate = true;
+}
+
+function updateQualityToggle() {
+  if (!dom.qualityToggle) return;
+  dom.qualityToggle.textContent = QUALITY.lite
+    ? 'Modo leve ativo · tentar qualidade alta'
+    : 'Qualidade alta · ativar modo leve';
+  dom.qualityToggle.title = QUALITY.lite
+    ? 'Menos texturas, luzes e efeitos. Use ?quality=high na URL para reverter.'
+    : 'Reduz o consumo de memória para TVs, Xbox e notebooks fracos.';
 }
 
 function bindUI() {
   dom.startBtn.addEventListener('click', startRun);
+
+  if (dom.qualityToggle) {
+    dom.qualityToggle.addEventListener('click', () => {
+      AudioEngine.click();
+      const url = new URL(window.location.href);
+      url.searchParams.set('quality', QUALITY.lite ? 'high' : 'low');
+      window.location.assign(url.toString());
+    });
+  }
 
   dom.resumeBtn.addEventListener('click', resumeRun);
   dom.pauseArchiveBtn.addEventListener('click', () => openArchive('paused'));
@@ -3810,7 +3952,7 @@ function init() {
   scene.fog = new THREE.FogExp2(0x05070b, 0.057);
   scene.add(world);
 
-  camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.08, 90);
+  camera = new THREE.PerspectiveCamera(72, window.innerWidth / window.innerHeight, 0.08, 60);
   camera.rotation.order = 'YXZ';
   camera.position.set(2, EYE_HEIGHT, 6.8);
   camera.rotation.set(0, Math.PI, 0, 'YXZ');
@@ -3820,6 +3962,7 @@ function init() {
   buildEntity();
   setupControls();
   bindUI();
+  updateQualityToggle();
 
   dom.bootLoading.classList.add('hidden');
   dom.startScreen.classList.remove('hidden');
@@ -3827,22 +3970,37 @@ function init() {
   requestAnimationFrame(animate);
 
   window.__borealBooted = true;
-  console.info('[BOREAL-7] Estação online. Sinal: 33 pulsos/min.');
+  console.info(
+    `[BOREAL-7] Estação online. Sinal: 33 pulsos/min. Modo: ${QUALITY.lite ? 'leve' : 'alto'}`
+    + ` · texturas x${QUALITY.texScale} · luzes reduzidas: ${QUALITY.lite ? 'sim' : 'não'}.`
+  );
+}
+
+function effectivePixelRatio() {
+  const base = Math.min(window.devicePixelRatio || 1, QUALITY.pixelRatio);
+  // Em telas 4K, limita o framebuffer a ~1080p no modo leve e ~1440p no alto.
+  const maxWidth = QUALITY.lite ? 1920 : 2560;
+  const scale = Math.min(1, maxWidth / Math.max(1, window.innerWidth * base));
+  return Math.max(0.5, base * scale);
 }
 
 function setupRenderer() {
   renderer = new THREE.WebGLRenderer({
     canvas: dom.canvas,
-    antialias: true,
-    powerPreference: 'high-performance'
+    antialias: QUALITY.antialias,
+    powerPreference: QUALITY.lite ? 'low-power' : 'high-performance',
+    preserveDrawingBuffer: false
   });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.55));
+  renderer.setPixelRatio(effectivePixelRatio());
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.16;
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.type = QUALITY.shadowType;
+  // sombras não mudam o tempo todo: atualiza a cada 2 frames no modo leve
+  renderer.shadowMap.autoUpdate = false;
+  renderer.shadowMap.needsUpdate = true;
   if ('useLegacyLights' in renderer) {
     // mantém as intensidades previsíveis em qualquer versão do three r160
     renderer.useLegacyLights = true;
