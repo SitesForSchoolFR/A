@@ -2732,6 +2732,12 @@ function enableFallbackLook() {
   if (state.fallbackLook) return;
   state.fallbackLook = true;
   showSubtitle('Mouse livre ativado. Mova o mouse para olhar; [E] ou clique para interagir.', 7);
+  // lembrete depois da introdução, para quem entra por um iframe sem Pointer Lock
+  schedule(() => {
+    if (state.phase === 'playing' && state.fallbackLook) {
+      showSubtitle('Mouse livre ativo: mova o cursor para olhar · [E] ou clique para interagir.', 7);
+    }
+  }, 9000);
 }
 
 function lockPointer() {
