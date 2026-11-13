@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BOREAL-7 — Horror Psicológico 3D</title>
+  <meta name="description" content="Um jogo de terror psicológico em primeira pessoa. Preso no subsolo da Estação Boreal-7, encontre os quatro registros da equipe, descubra o código e escape antes que o Sinal o alcance." />
+  <meta name="theme-color" content="#05070a" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="BOREAL-7 — O Sinal Aprende" />
+  <meta property="og:description" content="Preso no subsolo da Estação Boreal-7, encontre os quatro registros da equipe, descubra o código de evasão e escape antes que o Sinal encontre o seu rosto." />
+  <meta property="og:image" content="https://sitesforschoolfr.github.io/A/assets/title-bg.jpg" />
+  <meta property="og:url" content="https://sitesforschoolfr.github.io/A/" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='8' fill='%23080b10'/%3E%3Ccircle cx='32' cy='32' r='16' fill='none' stroke='%23d94a3d' stroke-width='3'/%3E%3Ccircle cx='32' cy='32' r='3' fill='%23d94a3d'/%3E%3Cpath d='M32 6v14M32 44v14M6 32h14M44 32h14' stroke='%23d94a3d' stroke-width='3'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="style.css" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script>
+    window.__borealBooted = false;
+    window.addEventListener('error', function (event) {
+      if (window.__borealBooted) return;
+      var bootError = document.getElementById('boot-error');
+      var bootLoading = document.getElementById('boot-loading');
+      if (bootError) bootError.classList.remove('hidden');
+      if (bootLoading) bootLoading.classList.add('hidden');
+      console.error('[BOREAL-7] Falha ao iniciar:', event.message || event);
+    }, true);
+    window.setTimeout(function () {
+      if (window.__borealBooted) return;
+      var bootError = document.getElementById('boot-error');
+      var bootLoading = document.getElementById('boot-loading');
+      if (bootError) bootError.classList.remove('hidden');
+      if (bootLoading) bootLoading.classList.add('hidden');
+    }, 15000);
+  </script>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="scene" aria-label="Ambiente 3D da Estação Boreal-7"></canvas>
+
+  <!-- ============ EFEITOS DE TELA ============ -->
+  <div class="fx" id="vignette" aria-hidden="true"></div>
+  <div class="fx" id="grain" aria-hidden="true"></div>
+  <div class="fx" id="scanlines" aria-hidden="true"></div>
+  <div class="fx" id="static-fx" aria-hidden="true"></div>
+  <div class="fx" id="damage" aria-hidden="true"></div>
+  <div id="fade" aria-hidden="true"></div>
+
+  <!-- ============ HUD ============ -->
+  <div id="hud" class="hidden" aria-hidden="true">
+    <div class="hud-corner hud-tl">
+      <div class="hud-label">ARQUIVO DA EQUIPE</div>
+      <div class="hud-records">
+        <span id="records-count">0</span><span class="slash">/</span><span>4</span>
+        <span class="hud-sub">registros</span>
+      </div>
+      <div class="record-pips" id="record-pips">
+        <i data-pip="1"></i><i data-pip="2"></i><i data-pip="3"></i><i data-pip="4"></i>
+      </div>
+    </div>
+
+    <div class="hud-corner hud-tr">
+      <div class="hud-label">LANTERNA <span id="flashlight-state">LIGADA</span></div>
+      <div class="battery"><div class="battery-fill" id="battery-fill"></div></div>
+      <div class="hud-sub"><span id="battery-pct">100%</span> · <kbd>F</kbd> alternar</div>
+    </div>
+
+    <div id="crosshair" aria-hidden="true"></div>
+    <div id="reticle-prompt" class="hidden">
+      <kbd>E</kbd><span id="prompt-text">Examinar</span>
+    </div>
+    <div id="subtitle" aria-live="polite"></div>
+    <div id="hud-help">
+      <span><kbd>WASD</kbd> mover</span>
+      <span><kbd>MOUSE</kbd> olhar</span>
+      <span><kbd>SHIFT</kbd> correr</span>
+      <span><kbd>F</kbd> lanterna</span>
+      <span><kbd>E</kbd> interagir</span>
+      <span><kbd>TAB</kbd> arquivo</span>
+    </div>
+  </div>
+
+  <!-- ============ LEITOR DE REGISTRO ============ -->
+  <div id="reader" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="reader-title">
+    <article class="document">
+      <header class="doc-head">
+        <div class="doc-kicker" id="reader-kicker">FITA 01 · ESTAÇÃO BOREAL-7</div>
+        <h2 id="reader-title">O primeiro pulso</h2>
+        <div class="doc-meta">
+          <span id="reader-author">Dra. Helena Vasques</span>
+          <span id="reader-date">12/08/1987 · 03:41</span>
+        </div>
+      </header>
+      <div class="doc-paper">
+        <p id="reader-body" class="doc-body"></p>
+      </div>
+      <footer class="doc-foot">
+        <div class="doc-digit">DÍGITO <b id="reader-digit">4</b></div>
+        <button type="button" class="btn btn-small" id="reader-close">Guardar registro <kbd>E</kbd></button>
+      </footer>
+      <div class="doc-skip" id="reader-skip">pressione <kbd>E</kbd> ou clique para revelar o texto inteiro</div>
+    </article>
+  </div>
+
+  <!-- ============ PAINEL / TECLADO ============ -->
+  <div id="keypad" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="keypad-title">
+    <div class="keypad-panel">
+      <div class="keypad-brand">BOREAL-7 · PROTOCOLO EVAC</div>
+      <h2 id="keypad-title">PAINEL DE EMERGÊNCIA</h2>
+      <p class="keypad-sub">Código de 4 dígitos. Cada registro da equipe contém um fragmento, na ordem do arquivo.</p>
+
+      <div class="keypad-display" id="keypad-display" aria-live="polite">
+        <span class="slot" data-slot="0">·</span>
+        <span class="slot" data-slot="1">·</span>
+        <span class="slot" data-slot="2">·</span>
+        <span class="slot" data-slot="3">·</span>
+      </div>
+      <div class="keypad-hint" id="keypad-hint">Fragmentos recuperados: nenhum</div>
+
+      <div class="keypad-grid" id="keypad-grid">
+        <button type="button" data-digit="1">1</button>
+        <button type="button" data-digit="2">2</button>
+        <button type="button" data-digit="3">3</button>
+        <button type="button" data-digit="4">4</button>
+        <button type="button" data-digit="5">5</button>
+        <button type="button" data-digit="6">6</button>
+        <button type="button" data-digit="7">7</button>
+        <button type="button" data-digit="8">8</button>
+        <button type="button" data-digit="9">9</button>
+        <button type="button" data-action="clear" class="key-fn">C</button>
+        <button type="button" data-digit="0">0</button>
+        <button type="button" data-action="confirm" class="key-fn key-ok">OK</button>
+      </div>
+
+      <div class="keypad-status" id="keypad-status">AGUARDANDO ENTRADA</div>
+      <button type="button" class="btn btn-ghost keypad-close" id="keypad-close">Fechar painel <kbd>ESC</kbd></button>
+    </div>
+  </div>
+
+  <!-- ============ ARQUIVO ============ -->
+  <div id="archive" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="archive-title">
+    <div class="archive-panel">
+      <div class="archive-head">
+        <div>
+          <div class="doc-kicker">ARQUIVO RECUPERADO</div>
+          <h2 id="archive-title">Registros da equipe</h2>
+        </div>
+        <div class="archive-count"><span id="archive-count">0</span>/4</div>
+      </div>
+      <div class="archive-list" id="archive-list"></div>
+      <div class="archive-code">
+        <span>CÓDIGO DE EVACUAÇÃO</span>
+        <div class="code-cells" id="archive-code">
+          <i>?</i><i>?</i><i>?</i><i>?</i>
+        </div>
+      </div>
+      <button type="button" class="btn btn-small" id="archive-close">Voltar ao subsolo <kbd>TAB</kbd></button>
+    </div>
+  </div>
+
+  <!-- ============ TELA INICIAL ============ -->
+  <div id="start-screen" class="overlay screen">
+    <div class="screen-bg" aria-hidden="true"></div>
+    <div class="menu-content start-content">
+      <div class="eyebrow">ESTAÇÃO METEOROLÓGICA E DE RÁDIO · 78° N · ABANDONADA EM 1987</div>
+      <h1 class="game-title">
+        <span class="title-boreal">BOREAL</span><span class="title-seven">-7</span>
+      </h1>
+      <div class="title-rule"><span>O SINAL APRENDE</span></div>
+
+      <p class="premise">
+        Você acorda no subsolo de uma estação de pesquisas enterrada na neve. A porta de emergência
+        está trancada, o gerador morreu e o zumbido nos canos não é mecânico. A equipe científica
+        deixou quatro registros espalhados pelas salas — eles captaram um sinal anômalo, e algo
+        entrou na estação com ele.
+      </p>
+      <p class="premise premise-dim">
+        Recupere os 4 registros, descubra os quatro dígitos do protocolo de evacuação e saia
+        antes que o Sinal encontre o seu rosto.
+      </p>
+
+      <div class="controls-grid">
+        <div><kbd>WASD</kbd><span>mover</span></div>
+        <div><kbd>MOUSE</kbd><span>olhar</span></div>
+        <div><kbd>SHIFT</kbd><span>correr</span></div>
+        <div><kbd>E</kbd><span>interagir / ler</span></div>
+        <div><kbd>F</kbd><span>lanterna</span></div>
+        <div><kbd>TAB</kbd><span>arquivo</span></div>
+      </div>
+
+      <div class="start-actions">
+        <button type="button" class="btn btn-primary" id="start-btn">Iniciar Investigação</button>
+        <div class="start-note">Use fones de ouvido · contém luzes piscando e sons intensos</div>
+      </div>
+
+      <div class="start-foot">
+        <span>BOREAL-7 · REGISTRO DE INCIDENTE 033</span>
+        <span class="blink">SINAL ATIVO</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ PAUSA ============ -->
+  <div id="pause-screen" class="overlay screen hidden" role="dialog" aria-modal="true" aria-labelledby="pause-title">
+    <div class="screen-bg" aria-hidden="true"></div>
+    <div class="menu-content narrow">
+      <div class="eyebrow">TRANSMISSÃO INTERROMPIDA</div>
+      <h2 class="menu-title" id="pause-title">PAUSA</h2>
+      <p class="premise premise-dim">A estação espera. O sinal não.</p>
+      <div class="menu-actions">
+        <button type="button" class="btn btn-primary" id="resume-btn">Continuar</button>
+        <button type="button" class="btn" id="pause-archive-btn">Arquivo de registros</button>
+        <button type="button" class="btn" id="pause-restart-btn">Recomeçar investigação</button>
+        <button type="button" class="btn btn-ghost" id="pause-menu-btn">Voltar ao título</button>
+      </div>
+      <div class="start-note">Clique em Continuar para retomar o controle do mouse</div>
+    </div>
+  </div>
+
+  <!-- ============ GAME OVER ============ -->
+  <div id="gameover-screen" class="overlay screen hidden" role="dialog" aria-modal="true" aria-labelledby="gameover-title">
+    <div class="screen-bg death-bg" aria-hidden="true"></div>
+    <div class="menu-content narrow">
+      <div class="eyebrow danger">SINAL ADQUIRIDO · 33 PULSOS/MIN</div>
+      <h2 class="menu-title glitch death-title" id="gameover-title" data-text="O SINAL APRENDEU SEU ROSTO">O SINAL APRENDEU SEU ROSTO</h2>
+      <p class="premise">
+        O corredor não termina mais. O zumbido agora vem de dentro da sua cabeça, no mesmo compasso
+        das batidas que a equipe ouviu no rádio. A estação Boreal-7 registra um novo pulso:
+        trinta e três por minuto. O seu.
+      </p>
+      <div class="death-stats">
+        <div><span>REGISTROS</span><b id="gameover-records">0/4</b></div>
+        <div><span>FRAGMENTOS</span><b id="gameover-code">????????</b></div>
+        <div><span>TEMPO NO SUBSOLO</span><b id="gameover-time">00:00</b></div>
+      </div>
+      <div class="menu-actions">
+        <button type="button" class="btn btn-primary" id="retry-btn">Tentar novamente</button>
+        <button type="button" class="btn btn-ghost" id="gameover-menu-btn">Voltar ao título</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ FINAL ============ -->
+  <div id="ending-screen" class="overlay screen hidden" role="dialog" aria-modal="true" aria-labelledby="ending-title">
+    <div class="screen-bg ending-bg" aria-hidden="true"></div>
+    <div class="menu-content narrow">
+      <div class="eyebrow">PROTOCOLO EVAC · ACEITO</div>
+      <h2 class="menu-title ending-title" id="ending-title">A PORTA SE ABRE</h2>
+      <p class="premise" id="ending-summary">
+        Você atravessa o corredor de emergência sem olhar para trás. A neve, lá fora, é branca
+        demais para ser real.
+      </p>
+      <div class="ending-epilogue">
+        <p>A fechadura cede com um estalo úmido. O ar de fora entra pela fenda e você sente, pela primeira vez em dias, que o frio tem um cheiro — metal, neve, diesel.</p>
+        <p>A luz branca do corredor te engole. Você sobe as escadas sem olhar para trás. Na superfície, a tempestade limpou o céu e a antena norte continua apontada para o nada.</p>
+        <p>O helicóptero de resgate chega ao amanhecer. O piloto pergunta o seu nome duas vezes, como se a primeira não tivesse saído da sua boca. No rádio, entre o chiado, trinta e três batidas por minuto. Ele sorri e diz que é só interferência.</p>
+        <p>Você conta os pulsos até o fim da viagem. São sempre trinta e três. E, quando o helicóptero pousa, a equipe de resgate já está esperando — nove pessoas, todas com o seu rosto.</p>
+      </div>
+      <div class="ending-stats">
+        <div><span>CÓDIGO USADO</span><b id="ending-code">4729</b></div>
+        <div><span>REGISTROS</span><b id="ending-records">4/4</b></div>
+        <div><span>TEMPO</span><b id="ending-time">00:00</b></div>
+      </div>
+      <div class="menu-actions">
+        <button type="button" class="btn btn-primary" id="ending-retry-btn">Descer outra vez</button>
+        <button type="button" class="btn btn-ghost" id="ending-menu-btn">Voltar ao título</button>
+      </div>
+      <div class="ending-final">o sinal não terminou. apenas aprendeu a esperar.</div>
+    </div>
+  </div>
+
+  <!-- ============ CARREGAMENTO ============ -->
+  <div id="boot-loading" class="overlay screen boot">
+    <div class="boot-inner">
+      <div class="boot-wave" aria-hidden="true"></div>
+      <div class="eyebrow">CALIBRANDO RECEPTOR</div>
+      <div class="boot-text">BOREAL-7</div>
+      <div class="boot-sub">aguarde · sincronizando 33 pulsos</div>
+    </div>
+  </div>
+
+  <div id="boot-error" class="overlay screen hidden">
+    <div class="menu-content narrow">
+      <div class="eyebrow danger">FALHA DE SINAL</div>
+      <h2 class="menu-title">NÃO FOI POSSÍVEL CARREGAR O THREE.JS</h2>
+      <p class="premise">
+        O jogo depende da biblioteca Three.js servida por CDN. Verifique sua conexão,
+        recarregue a página ou tente novamente mais tarde.
+      </p>
+      <div class="menu-actions">
+        <button type="button" class="btn btn-primary" onclick="location.reload()">Recarregar</button>
+      </div>
+    </div>
+  </div>
+
+  <noscript>
+    <div class="noscript">BOREAL-7 exige JavaScript ativado para funcionar.</div>
+  </noscript>
+</div>
+
+<script type="module" src="script.js"></script>
+</body>
+</html>
