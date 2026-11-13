@@ -17,6 +17,7 @@ Um jogo de **terror psicológico 3D em primeira pessoa**, feito para rodar diret
 - [Mecânicas](#mecânicas)
 - [A Estação](#a-estação)
 - [Recursos técnicos](#recursos-técnicos)
+- [Modo leve e Xbox](#modo-leve-e-xbox)
 - [Estrutura do projeto](#estrutura-do-projeto)
 - [Deploy no GitHub Pages](#deploy-no-github-pages)
 - [Avisos e solução de problemas](#avisos-e-solução-de-problemas)
@@ -106,7 +107,37 @@ Atmosfera: `FogExp2` densa, lanternas de emergência vermelhas pulsando, lâmpad
 - IA da entidade com **BFS em grafo de waypoints**, linha de visão por raycast contra as paredes e estados de perseguição/frenagem.
 - **Áudio procedural** com WebAudio (osciladores, ruído, filtros e envelopes).
 - Interface em HTML/CSS puro, com HUD, leitor de documentos, teclado, arquivo, pausa, game over e final.
-- Sem dependências de build, sem bundler, sem assets binários obrigatórios.
+- **Sem dependências de build para jogar**: o site usa `script.min.js` + `style.min.css`; os fontes `script.js`/`style.css` ficam no repositório para manutenção.
+- **Orçamento de qualidade** (`QUALITY`): modo alto e modo leve compartilham a mesma lógica de jogo, mudando apenas o custo gráfico (resolução, texturas, luzes, partículas e sombras).
+
+---
+
+## Modo leve e Xbox
+
+O jogo foi endurecido para rodar em **Edge no Xbox Series S** e em máquinas com pouca memória de vídeo, onde o navegador pode encerrar a página com erros como `SBOX_MEMORY_EXCEEDED`. O modo leve é ativado sozinho quando detecta **Xbox**, celular/tablet, `deviceMemory <= 4 GB` ou `hardwareConcurrency <= 4`.
+
+O que muda no modo leve:
+
+| Recurso | Qualidade alta | Modo leve |
+| --- | --- | --- |
+| Framebuffer / pixel ratio | até 1.35, máx. 2560 px | **1.0, máx. 1920 px** |
+| Antialias / contexto | ligado / `high-performance` | desligado / `low-power` |
+| Texturas procedurais | 100% | **50%** (metade de cada eixo) |
+| Mipmaps / anisotropia | sim / 4× | não / 2× |
+| Luzes pontuais | 9 | **5** (as distantes continuam acesas em emissivo + sprite) |
+| Poeira / aura | 800 / 220 partículas | **260 / 90** |
+| Sombras da lanterna | 1024 px, todo frame | **512 px, a cada 2 frames** |
+| Ruído SVG, estática e desfoques de CSS | ligados | **desligados** |
+| Fundo animado das telas | ligado | **desligado** |
+
+O cenário, a história, a HUD, a IA, o áudio e o final **não mudam**. Para alternar manualmente, use o botão da tela inicial ou acrescente à URL:
+
+```
+?quality=low    # força o modo leve
+?quality=high   # força a qualidade alta
+```
+
+A escolha é aplicada ao recarregar a página. Se o jogo ainda ficar pesado no Xbox, tente fechar outras abas/streaming em segundo plano, usar a janela inteira (não o modo Snap) e manter `?quality=low`.
 
 ---
 
@@ -114,16 +145,21 @@ Atmosfera: `FogExp2` densa, lanternas de emergência vermelhas pulsando, lâmpad
 
 ```
 .
-├── index.html              # estrutura, telas, HUD e importmap da CDN
-├── style.css               # direção de arte da interface e efeitos de tela
-├── script.js               # motor do jogo, mundo 3D, IA, áudio e narrativa
+├── index.html              # estrutura, telas, HUD, importmap e detecção do modo leve
+├── style.min.css           # CSS minificado usado pelo site
+├── script.min.js           # JS minificado usado pelo site
+├── style.css               # fonte comentada da interface
+├── script.js               # fonte comentada do motor, mundo 3D, IA, áudio e narrativa
+├── build.sh                # regenera os .min (terser + csso)
 ├── assets/
-│   └── title-bg.jpg        # arte atmosférica da tela inicial
+│   └── title-bg.webp       # arte atmosférica da tela inicial (66 KB)
 ├── .nojekyll               # impede o processamento Jekyll no GitHub Pages
 └── README.md
 ```
 
-Todo o jogo está concentrado em `script.js`, organizado em seções numeradas (dados, áudio, texturas, mundo, entidade, jogador/UI, loop).
+Todo o jogo está concentrado em `script.js`, organizado em seções numeradas (dados, áudio, texturas, mundo, entidade, jogador/UI, loop). Depois de editar os fontes, rode `./build.sh` para atualizar `script.min.js` e `style.min.css`; sem isso, o site continua servindo a versão minificada antiga.
+
+Tamanhos atuais (aprox.): `script.min.js` 77 KB, `style.min.css` 25 KB, `index.html` 16 KB, `assets/title-bg.webp` 66 KB — **~186 KB no total**, contra ~400 KB da versão anterior.
 
 ---
 
@@ -151,7 +187,7 @@ O projeto não precisa de workflow de CI: é estático. Como o Three.js vem de C
 - **Tela preta / "Falha de sinal"**: a CDN do Three.js não carregou. Verifique a conexão, bloqueadores de script ou tente recarregar.
 - **O mouse não é capturado**: alguns iframes e políticas de navegador bloqueiam o Pointer Lock. O jogo ativa o modo de mouse livre automaticamente. Em página própria, clique na cena para tentar novamente.
 - **Sem áudio**: navegadores só liberam áudio após uma interação — o som inicia ao clicar em **Iniciar Investigação**.
-- **Desempenho**: o jogo limita o pixel ratio e usa sombras apenas na lanterna. Em máquinas modestas, reduza o zoom da janela ou feche outras abas com WebGL.
+- **Desempenho / Xbox / `SBOX_MEMORY_EXCEEDED`**: o jogo detecta Xbox e ativa o modo leve automaticamente. Se ainda aparecer erro de memória, abra `?quality=low`, feche outras abas com WebGL e evite janelas muito grandes. Detalhes na seção [Modo leve e Xbox](#modo-leve-e-xbox).
 
 ---
 
